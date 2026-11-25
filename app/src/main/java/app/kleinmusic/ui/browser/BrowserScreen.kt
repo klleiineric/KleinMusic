@@ -1,20 +1,5 @@
 package app.kleinmusic.ui.browser
 
-import android.annotation.SuppressLint
-import android.content.Context
-import android.content.Intent
-import android.graphics.Bitmap
-import android.net.Uri
-import android.net.http.SslError
-import android.os.Bundle
-import android.webkit.CookieManager
-import android.webkit.SslErrorHandler
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceError
-import android.webkit.WebResourceRequest
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -41,12 +26,11 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -55,6 +39,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
@@ -71,11 +56,7 @@ import app.kleinmusic.browser.BrowserViewModel
 import app.kleinmusic.browser.UrlUtils
 import app.kleinmusic.data.Favorite
 import app.kleinmusic.ui.theme.KleinColors
-import java.util.concurrent.atomic.AtomicBoolean
 
-private val EXTERNAL_SCHEMES = setOf("mailto", "tel", "sms", "geo", "market", "intent")
-
-@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserScreen(vm: BrowserViewModel) {
     val context = LocalContext.current
@@ -85,162 +66,56 @@ fun BrowserScreen(vm: BrowserViewModel) {
     val tabs by vm.tabs.collectAsState()
     val activeId by vm.activeId.collectAsState()
     val favorites by vm.favorites.collectAsState()
-    val pending by vm.pendingUrl.collectAsState()
     val activeTab = tabs.firstOrNull { it.id == activeId } ?: return
 
-    var canBack by remember { mutableStateOf(false) }
-    var canForward by remember { mutableStateOf(false) }
-    var loadProgress by remember { mutableStateOf(100) }
-    var loadError by remember { mutableStateOf<String?>(null) }
+    // Controlador (e WebView) da aba ativa. Cada aba tem o seu.
+    val controller = remember(activeId) { vm.controller(activeId) }
     var field by remember(activeId, activeTab.url) { mutableStateOf(TextFieldValue(activeTab.url)) }
 
-    val currentId = rememberUpdatedState(activeId)
-    val clearNext = remember { AtomicBoolean(false) }
+    // Quando a aba sai da tela, solta a Activity (evita vazamento de memória).
+    DisposableEffect(controller) { onDispose { controller.detach() } }
 
-    // Um único WebView para todas as abas: economiza memória.
-    val webView = remember {
-        WebView(context).apply {
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                useWideViewPort = true
-                loadWithOverviewMode = true
-                setSupportZoom(true)
-                builtInZoomControls = true
-                displayZoomControls = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
-                // Alguns sites (ex.: login) recusam o identificador "wv" de WebView.
-                userAgentString = userAgentString.replace("; wv", "")
-            }
-            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
-
-            webViewClient = object : WebViewClient() {
-                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
-                    val uri = request?.url ?: return false
-                    if (uri.scheme?.lowercase() in EXTERNAL_SCHEMES) {
-                        openExternal(context, uri.toString())
-                        return true
-                    }
-                    return false
-                }
-
-                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                    loadError = null
-                }
-
-                override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
-                    if (view == null || url.isNullOrBlank() || url == "about:blank") return
-                    canBack = view.canGoBack()
-                    canForward = view.canGoForward()
-                    vm.update(currentId.value, url = url)
-                }
-
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    if (view == null || url == null) return
-                    // Primeira página de uma aba nova: apaga o histórico da aba anterior.
-                    if (clearNext.getAndSet(false)) {
-                        view.clearHistory()
-                        canBack = false
-                        canForward = false
-                    }
-                    vm.update(currentId.value, title = view.title)
-                    if (loadError == null) vm.recordVisit(view.title ?: url, url)
-                }
-
-                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
-                    if (request?.isForMainFrame == true) {
-                        loadError = error?.description?.toString() ?: "Erro desconhecido"
-                    }
-                }
-
-                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
-                    handler?.cancel() // nunca continua com certificado inválido
-                    loadError = "O certificado de segurança do site é inválido."
-                }
-            }
-
-            webChromeClient = object : WebChromeClient() {
-                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                    loadProgress = newProgress
-                }
-
-                override fun onReceivedTitle(view: WebView?, title: String?) {
-                    if (!title.isNullOrBlank()) vm.update(currentId.value, title = title)
-                }
-            }
-        }
-    }
-
-    fun saveCurrent(id: Int) {
-        val tab = vm.tab(id) ?: return
-        if (tab.url.isBlank()) return
-        val bundle = Bundle()
-        webView.saveState(bundle)
-        vm.saveState(id, bundle)
-    }
-
-    fun load(url: String) {
-        if (url.isBlank()) return
-        loadError = null
-        vm.update(activeId, url = url)
-        webView.loadUrl(url)
-    }
-
-    // Troca de aba: guarda o estado da anterior e restaura a nova.
-    var shownId by remember { mutableStateOf<Int?>(null) }
-    LaunchedEffect(activeId) {
-        shownId?.let { if (it != activeId) saveCurrent(it) }
-        loadError = null
-        val saved = vm.tab(activeId)?.state
-        if (saved != null) {
-            clearNext.set(false)
-            webView.restoreState(saved)
-        } else {
-            clearNext.set(true)
-            canBack = false
-            canForward = false
-        }
-        shownId = activeId
-    }
-
-    // Endereço pedido por outra tela (Biblioteca).
-    LaunchedEffect(pending) {
-        pending?.let { load(it); vm.consumePending() }
-    }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            saveCurrent(currentId.value)
-            webView.destroy()
-        }
-    }
-
-    BackHandler(enabled = canBack) { webView.goBack() }
+    // Botão voltar do celular: volta na página da aba, se houver.
+    BackHandler(enabled = controller.canGoBack) { controller.goBack() }
 
     val hasPage = activeTab.url.isNotBlank()
-    val loading = hasPage && loadProgress < 100
+    val loading = hasPage && controller.loading
     val isFavorite = favorites.any { it.url == activeTab.url }
 
+    fun submit() {
+        val url = UrlUtils.toUrl(field.text)
+        if (url.isNotBlank()) {
+            vm.navigate(url)
+            keyboard?.hide()
+            focusManager.clearFocus()
+        }
+    }
+
     Column(Modifier.fillMaxSize().background(KleinColors.Background)) {
-        // Barra de endereço
+        // Barra de endereço: lê o texto e abre o endereço ou pesquisa no DuckDuckGo
         OutlinedTextField(
             value = field,
             onValueChange = { field = it },
             modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
+                .testTag("endereco")
                 .onFocusChanged { if (it.isFocused) field = field.copy(selection = TextRange(0, field.text.length)) },
             singleLine = true,
             shape = RoundedCornerShape(24.dp),
             placeholder = { Text("Buscar ou digitar endereço") },
+            trailingIcon = {
+                Text(
+                    "→",
+                    Modifier.semantics { contentDescription = "Ir" }.clickable { submit() }.padding(12.dp),
+                    color = KleinColors.Orange, fontSize = 22.sp
+                )
+            },
             keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-            keyboardActions = KeyboardActions(onGo = {
-                load(UrlUtils.toUrl(field.text))
-                keyboard?.hide()
-                focusManager.clearFocus()
-            })
+            keyboardActions = KeyboardActions(onGo = { submit() })
         )
+
         // Indicador de carregamento
         if (loading) {
-            LinearProgressIndicator(progress = { loadProgress / 100f }, modifier = Modifier.fillMaxWidth())
+            LinearProgressIndicator(progress = { controller.progress / 100f }, modifier = Modifier.fillMaxWidth())
         }
 
         // Faixa de abas
@@ -253,26 +128,34 @@ fun BrowserScreen(vm: BrowserViewModel) {
             }
         }
 
-        // Conteúdo: o WebView fica sempre presente; as outras telas o cobrem quando necessário.
+        // Conteúdo: o WebView da aba ativa. As telas abaixo o cobrem quando necessário.
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
+            key(activeId) {
+                AndroidView(
+                    factory = {
+                        controller.attach(context)
+                        controller.webView
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
             if (!hasPage) {
-                NewTabPage(favorites) { load(it) }
-            } else if (loadError != null) {
-                ErrorPage(loadError ?: "") { webView.reload() }
+                NewTabPage(favorites) { vm.navigate(it) }
+            } else if (controller.error != null) {
+                ErrorPage(controller.error ?: "") { controller.reload() }
             }
         }
 
-        // Barra de ferramentas do navegador
+        // Barra de ferramentas: cada botão chama uma ação real do WebView da aba ativa
         Row(
             Modifier.fillMaxWidth().background(KleinColors.Surface),
             horizontalArrangement = Arrangement.SpaceAround,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            ToolButton("‹", "Voltar", canBack) { webView.goBack() }
-            ToolButton("›", "Avançar", canForward) { webView.goForward() }
+            ToolButton("‹", "Voltar", controller.canGoBack) { controller.goBack() }
+            ToolButton("›", "Avançar", controller.canGoForward) { controller.goForward() }
             ToolButton(if (loading) "✕" else "⟳", if (loading) "Parar" else "Atualizar", hasPage) {
-                if (loading) webView.stopLoading() else webView.reload()
+                if (loading) controller.stop() else controller.reload()
             }
             ToolButton("＋", "Nova aba", true) { vm.newTab() }
             ToolButton(
@@ -280,23 +163,6 @@ fun BrowserScreen(vm: BrowserViewModel) {
                 tint = KleinColors.Orange
             ) { vm.toggleFavorite(activeTab.url, activeTab.title) }
         }
-    }
-}
-
-private fun openExternal(context: Context, url: String) {
-    try {
-        val intent = if (url.startsWith("intent:")) {
-            Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
-                addCategory(Intent.CATEGORY_BROWSABLE)
-                component = null
-                selector = null
-            }
-        } else {
-            Intent(Intent.ACTION_VIEW, Uri.parse(url))
-        }
-        context.startActivity(intent)
-    } catch (_: Exception) {
-        // Nenhum app para abrir este tipo de link: ignora.
     }
 }
 
@@ -331,7 +197,8 @@ private fun TabChip(tab: BrowserTab, active: Boolean, onSelect: () -> Unit, onCl
         Row(Modifier.padding(horizontal = 10.dp, vertical = 7.dp), verticalAlignment = Alignment.CenterVertically) {
             Text(tab.title, Modifier.widthIn(max = 120.dp), maxLines = 1, overflow = TextOverflow.Ellipsis,
                 color = KleinColors.Text, fontSize = 13.sp)
-            Text("✕", Modifier.clickable(onClick = onClose).padding(start = 8.dp),
+            Text("✕", Modifier.semantics { contentDescription = "Fechar aba" }
+                .clickable(onClick = onClose).padding(start = 8.dp),
                 color = KleinColors.Muted, fontSize = 13.sp)
         }
     }

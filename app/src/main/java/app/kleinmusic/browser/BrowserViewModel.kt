@@ -1,7 +1,6 @@
 package app.kleinmusic.browser
 
 import android.app.Application
-import android.os.Bundle
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import app.kleinmusic.data.AppDatabase
@@ -17,8 +16,7 @@ import kotlinx.coroutines.launch
 data class BrowserTab(
     val id: Int,
     val title: String = "Nova aba",
-    val url: String = "",
-    val state: Bundle? = null   // histórico interno da aba, guardado ao trocar de aba
+    val url: String = ""
 )
 
 class BrowserViewModel(app: Application) : AndroidViewModel(app) {
@@ -26,15 +24,14 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1
     private var lastRecorded = ""
 
+    // Cada aba tem o seu próprio controlador (e o seu próprio WebView).
+    private val controllers = mutableMapOf<Int, TabController>()
+
     private val _tabs = MutableStateFlow(listOf(BrowserTab(nextId++)))
     val tabs: StateFlow<List<BrowserTab>> = _tabs.asStateFlow()
 
     private val _activeId = MutableStateFlow(_tabs.value.first().id)
     val activeId: StateFlow<Int> = _activeId.asStateFlow()
-
-    // Endereço pedido por outra tela (ex.: Biblioteca) para abrir na aba ativa
-    private val _pendingUrl = MutableStateFlow<String?>(null)
-    val pendingUrl: StateFlow<String?> = _pendingUrl.asStateFlow()
 
     val history: StateFlow<List<HistoryEntry>> = db.history().all()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -44,18 +41,37 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
 
     fun tab(id: Int): BrowserTab? = _tabs.value.firstOrNull { it.id == id }
 
+    /** Devolve o controlador (WebView) da aba, criando-o na primeira vez. */
+    fun controller(id: Int): TabController = controllers.getOrPut(id) {
+        TabController(
+            app = getApplication(),
+            onUrl = { url -> update(id, url = url) },
+            onTitle = { title -> update(id, title = title) },
+            onVisit = { title, url -> recordVisit(title, url) }
+        )
+    }
+
+    /** Abre o endereço na aba ativa. */
+    fun navigate(url: String) {
+        if (url.isBlank()) return
+        val id = _activeId.value
+        update(id, title = UrlUtils.host(url), url = url)
+        controller(id).load(url)
+    }
+
     fun newTab() {
         val t = BrowserTab(nextId++)
         _tabs.value = _tabs.value + t
         _activeId.value = t.id
     }
 
-    fun select(id: Int) { _activeId.value = id }
+    fun select(id: Int) { if (tab(id) != null) _activeId.value = id }
 
     fun close(id: Int) {
         val list = _tabs.value
         val index = list.indexOfFirst { it.id == id }
         if (index < 0) return
+        controllers.remove(id)?.destroy()
         val rest = list.filter { it.id != id }
         if (rest.isEmpty()) {
             val t = BrowserTab(nextId++)
@@ -72,13 +88,6 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
             if (it.id == id) it.copy(title = title ?: it.title, url = url ?: it.url) else it
         }
     }
-
-    fun saveState(id: Int, state: Bundle) {
-        _tabs.value = _tabs.value.map { if (it.id == id) it.copy(state = state) else it }
-    }
-
-    fun requestOpen(url: String) { _pendingUrl.value = url }
-    fun consumePending() { _pendingUrl.value = null }
 
     fun recordVisit(title: String, url: String) {
         if (url.isBlank() || url == "about:blank" || url == lastRecorded) return
@@ -98,5 +107,11 @@ class BrowserViewModel(app: Application) : AndroidViewModel(app) {
             if (favorites.value.any { it.url == url }) db.favorites().remove(url)
             else db.favorites().add(Favorite(url, title.ifBlank { url }, System.currentTimeMillis()))
         }
+    }
+
+    override fun onCleared() {
+        controllers.values.forEach { it.destroy() }
+        controllers.clear()
+        super.onCleared()
     }
 }

@@ -13,6 +13,7 @@ object UrlUtils {
         val text = input.trim()
         if (text.isEmpty()) return ""
         if (text.startsWith("http://") || text.startsWith("https://")) return text
+        if (text.startsWith("data:") || text.startsWith("about:")) return text
         if (LOCAL.matches(text)) return "http://$text"
         val parecendoEndereco = !text.contains(' ') && Patterns.WEB_URL.matcher(text).matches()
         return if (parecendoEndereco) "https://$text"

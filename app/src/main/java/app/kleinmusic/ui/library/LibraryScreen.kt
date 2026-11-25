@@ -35,7 +35,7 @@ fun LibraryScreen(vm: BrowserViewModel, onOpenInBrowser: () -> Unit) {
     val history by vm.history.collectAsState()
 
     fun open(url: String) {
-        vm.requestOpen(url)   // a tela do navegador carrega o endereço
+        vm.navigate(url)      // carrega o endereço na aba ativa
         onOpenInBrowser()     // e a navegação troca para a aba Navegador
     }
 
