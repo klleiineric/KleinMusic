@@ -1,7 +1,18 @@
 package app.kleinmusic.ui.browser
 
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.net.Uri
+import android.net.http.SslError
 import android.os.Bundle
+import android.webkit.CookieManager
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
@@ -13,6 +24,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -22,6 +34,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
@@ -37,9 +50,18 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -51,9 +73,15 @@ import app.kleinmusic.data.Favorite
 import app.kleinmusic.ui.theme.KleinColors
 import java.util.concurrent.atomic.AtomicBoolean
 
+private val EXTERNAL_SCHEMES = setOf("mailto", "tel", "sms", "geo", "market", "intent")
+
+@SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun BrowserScreen(vm: BrowserViewModel) {
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+
     val tabs by vm.tabs.collectAsState()
     val activeId by vm.activeId.collectAsState()
     val favorites by vm.favorites.collectAsState()
@@ -62,8 +90,9 @@ fun BrowserScreen(vm: BrowserViewModel) {
 
     var canBack by remember { mutableStateOf(false) }
     var canForward by remember { mutableStateOf(false) }
-    var progress by remember { mutableStateOf(100) }
-    var address by remember(activeId, activeTab.url) { mutableStateOf(activeTab.url) }
+    var loadProgress by remember { mutableStateOf(100) }
+    var loadError by remember { mutableStateOf<String?>(null) }
+    var field by remember(activeId, activeTab.url) { mutableStateOf(TextFieldValue(activeTab.url)) }
 
     val currentId = rememberUpdatedState(activeId)
     val clearNext = remember { AtomicBoolean(false) }
@@ -71,9 +100,34 @@ fun BrowserScreen(vm: BrowserViewModel) {
     // Um único WebView para todas as abas: economiza memória.
     val webView = remember {
         WebView(context).apply {
-            settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true
+            settings.apply {
+                javaScriptEnabled = true
+                domStorageEnabled = true
+                useWideViewPort = true
+                loadWithOverviewMode = true
+                setSupportZoom(true)
+                builtInZoomControls = true
+                displayZoomControls = false
+                mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                // Alguns sites (ex.: login) recusam o identificador "wv" de WebView.
+                userAgentString = userAgentString.replace("; wv", "")
+            }
+            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
             webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, request: WebResourceRequest?): Boolean {
+                    val uri = request?.url ?: return false
+                    if (uri.scheme?.lowercase() in EXTERNAL_SCHEMES) {
+                        openExternal(context, uri.toString())
+                        return true
+                    }
+                    return false
+                }
+
+                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                    loadError = null
+                }
+
                 override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
                     if (view == null || url.isNullOrBlank() || url == "about:blank") return
                     canBack = view.canGoBack()
@@ -90,12 +144,28 @@ fun BrowserScreen(vm: BrowserViewModel) {
                         canForward = false
                     }
                     vm.update(currentId.value, title = view.title)
-                    vm.recordVisit(view.title ?: url, url)
+                    if (loadError == null) vm.recordVisit(view.title ?: url, url)
+                }
+
+                override fun onReceivedError(view: WebView?, request: WebResourceRequest?, error: WebResourceError?) {
+                    if (request?.isForMainFrame == true) {
+                        loadError = error?.description?.toString() ?: "Erro desconhecido"
+                    }
+                }
+
+                override fun onReceivedSslError(view: WebView?, handler: SslErrorHandler?, error: SslError?) {
+                    handler?.cancel() // nunca continua com certificado inválido
+                    loadError = "O certificado de segurança do site é inválido."
                 }
             }
+
             webChromeClient = object : WebChromeClient() {
                 override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                    progress = newProgress
+                    loadProgress = newProgress
+                }
+
+                override fun onReceivedTitle(view: WebView?, title: String?) {
+                    if (!title.isNullOrBlank()) vm.update(currentId.value, title = title)
                 }
             }
         }
@@ -111,6 +181,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
 
     fun load(url: String) {
         if (url.isBlank()) return
+        loadError = null
         vm.update(activeId, url = url)
         webView.loadUrl(url)
     }
@@ -119,6 +190,7 @@ fun BrowserScreen(vm: BrowserViewModel) {
     var shownId by remember { mutableStateOf<Int?>(null) }
     LaunchedEffect(activeId) {
         shownId?.let { if (it != activeId) saveCurrent(it) }
+        loadError = null
         val saved = vm.tab(activeId)?.state
         if (saved != null) {
             clearNext.set(false)
@@ -145,36 +217,30 @@ fun BrowserScreen(vm: BrowserViewModel) {
 
     BackHandler(enabled = canBack) { webView.goBack() }
 
+    val hasPage = activeTab.url.isNotBlank()
+    val loading = hasPage && loadProgress < 100
     val isFavorite = favorites.any { it.url == activeTab.url }
 
     Column(Modifier.fillMaxSize().background(KleinColors.Background)) {
-        // Barra superior: escudo, voltar, avançar, endereço, favorito
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Text("🛡", Modifier.padding(horizontal = 6.dp), fontSize = 18.sp) // bloqueador entra em outra etapa
-            NavButton("‹", canBack) { webView.goBack() }
-            NavButton("›", canForward) { webView.goForward() }
-            OutlinedTextField(
-                value = address,
-                onValueChange = { address = it },
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-                shape = RoundedCornerShape(24.dp),
-                placeholder = { Text("Buscar ou digitar endereço") },
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
-                keyboardActions = KeyboardActions(onGo = { load(UrlUtils.toUrl(address)) })
-            )
-            Text(
-                if (isFavorite) "★" else "☆",
-                Modifier.clickable { vm.toggleFavorite(activeTab.url, activeTab.title) }.padding(8.dp),
-                color = KleinColors.Orange, fontSize = 22.sp
-            )
-        }
-        if (progress < 100 && activeTab.url.isNotBlank()) {
-            LinearProgressIndicator(progress = { progress / 100f }, Modifier.fillMaxWidth())
+        // Barra de endereço
+        OutlinedTextField(
+            value = field,
+            onValueChange = { field = it },
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)
+                .onFocusChanged { if (it.isFocused) field = field.copy(selection = TextRange(0, field.text.length)) },
+            singleLine = true,
+            shape = RoundedCornerShape(24.dp),
+            placeholder = { Text("Buscar ou digitar endereço") },
+            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Go),
+            keyboardActions = KeyboardActions(onGo = {
+                load(UrlUtils.toUrl(field.text))
+                keyboard?.hide()
+                focusManager.clearFocus()
+            })
+        )
+        // Indicador de carregamento
+        if (loading) {
+            LinearProgressIndicator(progress = { loadProgress / 100f }, modifier = Modifier.fillMaxWidth())
         }
 
         // Faixa de abas
@@ -185,29 +251,72 @@ fun BrowserScreen(vm: BrowserViewModel) {
             items(tabs, key = { it.id }) { tab ->
                 TabChip(tab, tab.id == activeId, { vm.select(tab.id) }, { vm.close(tab.id) })
             }
-            item {
-                Text("＋", Modifier.clickable { vm.newTab() }.padding(horizontal = 12.dp, vertical = 6.dp),
-                    color = KleinColors.Text, fontSize = 20.sp)
+        }
+
+        // Conteúdo: o WebView fica sempre presente; as outras telas o cobrem quando necessário.
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
+            if (!hasPage) {
+                NewTabPage(favorites) { load(it) }
+            } else if (loadError != null) {
+                ErrorPage(loadError ?: "") { webView.reload() }
             }
         }
 
-        // Conteúdo: WebView sempre presente; a página da aba nova cobre ele quando a aba está vazia.
-        Box(Modifier.weight(1f).fillMaxWidth()) {
-            AndroidView(factory = { webView }, modifier = Modifier.fillMaxSize())
-            if (activeTab.url.isBlank()) {
-                NewTabPage(favorites) { load(it) }
+        // Barra de ferramentas do navegador
+        Row(
+            Modifier.fillMaxWidth().background(KleinColors.Surface),
+            horizontalArrangement = Arrangement.SpaceAround,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ToolButton("‹", "Voltar", canBack) { webView.goBack() }
+            ToolButton("›", "Avançar", canForward) { webView.goForward() }
+            ToolButton(if (loading) "✕" else "⟳", if (loading) "Parar" else "Atualizar", hasPage) {
+                if (loading) webView.stopLoading() else webView.reload()
             }
+            ToolButton("＋", "Nova aba", true) { vm.newTab() }
+            ToolButton(
+                if (isFavorite) "★" else "☆", "Favorito", hasPage,
+                tint = KleinColors.Orange
+            ) { vm.toggleFavorite(activeTab.url, activeTab.title) }
         }
     }
 }
 
+private fun openExternal(context: Context, url: String) {
+    try {
+        val intent = if (url.startsWith("intent:")) {
+            Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                component = null
+                selector = null
+            }
+        } else {
+            Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        // Nenhum app para abrir este tipo de link: ignora.
+    }
+}
+
 @Composable
-private fun NavButton(label: String, enabled: Boolean, onClick: () -> Unit) {
+private fun RowScope.ToolButton(
+    label: String,
+    description: String,
+    enabled: Boolean,
+    tint: Color = KleinColors.Text,
+    onClick: () -> Unit
+) {
     Text(
         label,
-        Modifier.clickable(enabled = enabled, onClick = onClick).padding(horizontal = 10.dp, vertical = 4.dp),
-        color = if (enabled) KleinColors.Text else KleinColors.Muted.copy(alpha = 0.4f),
-        fontSize = 28.sp
+        Modifier.weight(1f)
+            .semantics { contentDescription = description }
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(vertical = 8.dp),
+        color = if (enabled) tint else KleinColors.Muted.copy(alpha = 0.4f),
+        fontSize = 26.sp,
+        textAlign = TextAlign.Center
     )
 }
 
@@ -229,14 +338,28 @@ private fun TabChip(tab: BrowserTab, active: Boolean, onSelect: () -> Unit, onCl
 }
 
 @Composable
+private fun ErrorPage(message: String, onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().background(KleinColors.Background).padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text("Não foi possível abrir a página", color = KleinColors.Text, fontSize = 20.sp,
+            fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text(message, Modifier.padding(vertical = 12.dp), color = KleinColors.Muted, textAlign = TextAlign.Center)
+        Button(onClick = onRetry) { Text("Tentar novamente") }
+    }
+}
+
+@Composable
 private fun NewTabPage(favorites: List<Favorite>, onOpen: (String) -> Unit) {
     Column(Modifier.fillMaxSize().background(KleinColors.Background).padding(16.dp)) {
         Text("Klein Music", Modifier.fillMaxWidth().padding(vertical = 28.dp),
             color = KleinColors.Text, fontSize = 30.sp, fontWeight = FontWeight.ExtraBold,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            textAlign = TextAlign.Center)
         Text("Favoritos", color = KleinColors.Text, fontSize = 18.sp, fontWeight = FontWeight.Bold)
         if (favorites.isEmpty()) {
-            Text("Toque em ☆ ao lado do endereço para favoritar uma página.",
+            Text("Abra uma página e toque em ☆ para favoritar.",
                 Modifier.padding(top = 8.dp), color = KleinColors.Muted)
         }
         favorites.forEach { fav ->
