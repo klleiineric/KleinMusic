@@ -1,0 +1,4 @@
+native/adblock/target/
+.gradle/
+build/
+local.properties
